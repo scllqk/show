@@ -1,0 +1,310 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>增强版 JS-Native 接口检测器</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; padding: 18px; background:#f7f8fb; color:#111; }
+    h1 { margin:0 0 12px 0; font-size:20px; }
+    .controls { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px; }
+    button { padding:8px 10px; border-radius:8px; border:1px solid #d0d5df; background:white; cursor:pointer; }
+    button.primary { background:#0b63ff; color:white; border-color:#0b63ff; }
+    button.danger { background:#ff4d4f; color:white; border-color:#ff4d4f; }
+    #log { height:240px; overflow:auto; background:white; border:1px solid #e3e6ea; padding:8px; border-radius:8px; font-size:12px; }
+    table { width:100%; border-collapse:collapse; margin-top:12px; background:white; border:1px solid #e3e6ea; border-radius:6px; overflow:hidden; }
+    th, td { text-align:left; padding:8px; border-bottom:1px solid #f0f2f5; font-size:13px; }
+    th { background:#fafbfe; font-weight:600; }
+    .risk-high { color:#a60b0b; font-weight:700; }
+    .risk-medium { color:#b36a00; font-weight:600; }
+    .risk-low { color:#0b7a3f; }
+    #summary { margin-top:8px; font-size:13px; }
+    .small { font-size:12px; color:#666; }
+    .badge { display:inline-block; padding:3px 6px; border-radius:6px; background:#eef2ff; color:#0b63ff; margin-right:6px; font-size:12px; }
+    #riskSection { margin-top:20px; padding:10px; background:#fff0f0; border:1px solid #ffcccc; border-radius:8px; }
+    #riskSection h2 { margin:0 0 8px 0; color:#a60b0b; font-size:16px; }
+    #riskList { font-size:13px; line-height:1.6; }
+  </style>
+</head>
+<body>
+  <h1>增强版 JS-Native 接口检测器（含风险显示）</h1>
+
+  <!-- 操作按钮 -->
+  <div class="controls">
+    <button id="btnBaseline">采集基线</button>
+    <button id="btnStart" class="primary">开始监控</button>
+    <button id="btnStop" class="danger" disabled>停止</button>
+    <button id="btnExport">导出 JSON</button>
+    <button id="btnClear">清空</button>
+    <div style="flex:1"></div>
+    <div class="small">轮询间隔(ms): <input id="interval" type="number" value="1000" style="width:80px" /></div>
+    <div style="width:12px"></div>
+    <div class="small">递归深度: <input id="maxDepth" type="number" value="2" style="width:60px" /></div>
+  </div>
+
+  <!-- 汇总信息 -->
+  <div id="summary">
+    <span class="badge">发现总数: <span id="foundCount">0</span></span>
+    <span class="badge">新增(相对基线): <span id="newCount">0</span></span>
+    <span class="small">提示: 先在普通浏览器采集基线，再在 WebView 中启动监控。</span>
+  </div>
+
+  <!-- 风险接口高亮区域 -->
+  <div id="riskSection" style="display:none;">
+    <h2>⚠️ 检测到高风险接口：</h2>
+    <div id="riskList"></div>
+  </div>
+
+  <!-- 日志输出 -->
+  <div id="log"></div>
+
+  <!-- 结果表格 -->
+  <table id="resultTable">
+    <thead>
+      <tr><th>#</th><th>路径</th><th>类型</th><th>风险等级</th><th>可访问</th><th>备注</th></tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+
+<script>
+/*
+==============================================
+  JS-Native 接口检测器（中文注释版）
+  功能：
+    1. 枚举 window 及其子对象的属性，判断哪些可能为原生注入。
+    2. 支持采集基线、实时轮询新增对象。
+    3. 根据关键字评估风险并高亮显示。
+==============================================
+*/
+(function(){
+  const logEl = document.getElementById('log');
+  const tbody = document.querySelector('#resultTable tbody');
+  const foundCountEl = document.getElementById('foundCount');
+  const newCountEl = document.getElementById('newCount');
+  const riskSection = document.getElementById('riskSection');
+  const riskListEl = document.getElementById('riskList');
+
+  // --- 简单日志函数 ---
+  function log(...args){
+    const msg = args.map(a => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ');
+    const line = document.createElement('div');
+    line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+    logEl.appendChild(line);
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  // --- 安全获取属性 ---
+  function safeGet(obj, key){
+    try { return { ok: true, val: obj[key] }; }
+    catch(e) { return { ok: false, err: String(e) }; }
+  }
+
+  // --- 风险关键字表 ---
+  const RISK_KEYWORDS = [
+    { k: ["install","apk","download","update","upgrade"], score: 9 },
+    { k: ["exec","shell","cmd","run","evaluate","eval"], score: 9 },
+    { k: ["delete","remove","clear","wipe"], score: 8 },
+    { k: ["open","start","intent","activity"], score: 6 },
+    { k: ["getDevice","getIMEI","getContacts","getLocation","permission"], score: 8 },
+    { k: ["toast","showToast","alert"], score: 2 }
+  ];
+
+  // --- 根据关键字计算风险等级 ---
+  function computeRisk(path){
+    const lp = path.toLowerCase();
+    let max = 0;
+    RISK_KEYWORDS.forEach(group => {
+      group.k.forEach(kw => { if (lp.includes(kw.toLowerCase())) max = Math.max(max, group.score); });
+    });
+    if (max >= 9) return {level:'高风险', cls:'risk-high', score:max};
+    if (max >= 6) return {level:'中风险', cls:'risk-medium', score:max};
+    if (max > 0) return {level:'低风险', cls:'risk-low', score:max};
+    return {level:'无', cls:'', score:0};
+  }
+
+  // --- 安全递归枚举属性（避免死循环） ---
+  function safeEnumerate(rootObj, rootPath, maxDepth, seenPaths){
+    const results = [];
+    function walk(obj, path, depth){
+      if (depth > maxDepth || seenPaths.has(path)) return;
+      seenPaths.add(path);
+      let type = 'unknown';
+      try { type = typeof obj; } catch(e) {}
+      results.push({ path, type, accessible: true });
+      if (!obj || (type !== 'object' && type !== 'function')) return;
+
+      let names = [];
+      try { names = Object.getOwnPropertyNames(obj); }
+      catch(e){ for (const p in obj) names.push(p); }
+
+      for (const name of names){
+        if (name === 'constructor' || name === '__proto__') continue;
+        const childPath = path ? `${path}.${name}` : name;
+        let g = safeGet(obj, name);
+        if (!g.ok){
+          results.push({ path: childPath, type:'inaccessible', accessible:false, err:g.err });
+          continue;
+        }
+        const val = g.val;
+        let t = 'unknown';
+        try { t = typeof val; } catch(e){}
+        results.push({ path: childPath, type:t, accessible:true });
+        // 限制递归深度，避免进入 DOM 或 window 对象
+        if ((t === 'object' || t === 'function') && val && val !== obj && val !== window && !Array.isArray(val)){
+          try {
+            if (val.nodeType === undefined && !(val instanceof Element) && !(val instanceof Window)) {
+              walk(val, childPath, depth + 1);
+            }
+          } catch(e){}
+        }
+      }
+    }
+    walk(rootObj, rootPath, 0);
+    return results;
+  }
+
+  // --- 快照 window 顶层属性名 ---
+  function snapshotTopLevel(){
+    try { return Object.getOwnPropertyNames(window); }
+    catch(e){ const arr=[]; for (const k in window) arr.push(k); return arr; }
+  }
+
+  // --- 全局状态对象 ---
+  const state = {
+    baseline: new Set(),       // 基线集合
+    entries: {},               // 已检测的所有属性
+    monitorHandle: null
+  };
+
+  // --- 根据顶层属性构建检测结果 ---
+  function buildEntries(names, maxDepth){
+    const newEntries = {};
+    for (const name of names){
+      const g = safeGet(window, name);
+      const val = g.ok ? g.val : undefined;
+      const topPath = name;
+      const risk = computeRisk(topPath);
+      newEntries[topPath] = { path: topPath, type: g.ok ? typeof val : 'inaccessible', accessible:g.ok, risk, notes:g.err || '' };
+
+      if (g.ok && (typeof val === 'object' || typeof val === 'function') && val){
+        const enumerated = safeEnumerate(val, topPath, maxDepth, new Set());
+        for (const e of enumerated){
+          if (!newEntries[e.path]){
+            const r = computeRisk(e.path);
+            newEntries[e.path] = { path:e.path, type:e.type, accessible:e.accessible, risk:r, notes:e.err||'' };
+          }
+        }
+      }
+    }
+    return newEntries;
+  }
+
+  // --- 渲染表格与风险高亮 ---
+  function renderTable(){
+    tbody.innerHTML = '';
+    const rows = Object.values(state.entries).sort((a,b)=>a.path.localeCompare(b.path));
+    foundCountEl.textContent = rows.length;
+    let newCount = 0;
+    const risks = [];
+
+    for (const r of rows){
+      if (!state.baseline.has(r.path.split('.')[0])) newCount++;
+      if (r.risk.score >= 6) risks.push(r); // 只收集中高风险
+    }
+    newCountEl.textContent = newCount;
+
+    // 表格渲染
+    let idx=1;
+    for (const r of rows){
+      const tr=document.createElement('tr');
+      tr.innerHTML=`
+        <td>${idx++}</td>
+        <td><code>${r.path}</code></td>
+        <td>${r.type}</td>
+        <td class="${r.risk.cls}">${r.risk.level}</td>
+        <td>${r.accessible?'是':'否'}</td>
+        <td>${r.notes.replace(/</g,'&lt;')}</td>`;
+      tbody.appendChild(tr);
+    }
+
+    // 风险区域渲染
+    if (risks.length>0){
+      riskSection.style.display='block';
+      riskListEl.innerHTML=risks.map(r=>`<div><b>${r.path}</b> - ${r.risk.level} (${r.type})</div>`).join('');
+    } else {
+      riskSection.style.display='none';
+    }
+  }
+
+  // --- 按钮绑定 ---
+  document.getElementById('btnBaseline').addEventListener('click',()=>{
+    const names=snapshotTopLevel();
+    state.baseline=new Set(names);
+    log('已采集基线，共',names.length,'个顶层属性');
+    renderTable();
+  });
+
+  document.getElementById('btnStart').addEventListener('click',()=>{
+    const interval=parseInt(document.getElementById('interval').value)||1000;
+    const maxDepth=parseInt(document.getElementById('maxDepth').value)||2;
+    if(state.monitorHandle){log('监控已运行中');return;}
+    const top=snapshotTopLevel();
+    state.entries=buildEntries(top,maxDepth);
+    renderTable();
+    log('开始监控，间隔',interval,'ms，递归深度',maxDepth);
+    state.monitorHandle=setInterval(()=>{
+      const now=snapshotTopLevel();
+      for(const n of now){
+        if(!state.entries[n]){
+          const newE=buildEntries([n],maxDepth);
+          Object.assign(state.entries,newE);
+          log('发现新增全局对象:',n);
+        }
+      }
+      renderTable();
+    },interval);
+    document.getElementById('btnStart').disabled=true;
+    document.getElementById('btnStop').disabled=false;
+  });
+
+  document.getElementById('btnStop').addEventListener('click',()=>{
+    if(state.monitorHandle){
+      clearInterval(state.monitorHandle);
+      state.monitorHandle=null;
+      log('监控已停止');
+    }
+    document.getElementById('btnStart').disabled=false;
+    document.getElementById('btnStop').disabled=true;
+  });
+
+  document.getElementById('btnExport').addEventListener('click',()=>{
+    const arr=Object.values(state.entries);
+    const blob=new Blob([JSON.stringify(arr,null,2)],{type:'application/json'});
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');
+    a.href=url;a.download='detector_result_'+Date.now()+'.json';a.click();
+    URL.revokeObjectURL(url);
+    log('已导出结果',arr.length,'项');
+  });
+
+  document.getElementById('btnClear').addEventListener('click',()=>{
+    state.entries={};
+    tbody.innerHTML='';
+    foundCountEl.textContent='0';
+    newCountEl.textContent='0';
+    riskSection.style.display='none';
+    log('已清空结果');
+  });
+
+  // --- 初始化运行一次 ---
+  (function init(){
+    const names=snapshotTopLevel().slice(0,200);
+    state.entries=buildEntries(names,1);
+    renderTable();
+    log('初始化检测完成，可采集基线或开始监控。');
+  })();
+
+})();
+</script>
+</body>
+</html>
